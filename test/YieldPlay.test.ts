@@ -249,6 +249,78 @@ describe("YieldPlay – Avalanche mainnet fork (Euler eUSDC-19)", function () {
     console.log(`  user2 received: ${ethers.formatUnits(u2Received, 6)} USDC`);
   });
 
+  // ──────────────────────────────────────────────────────────────────────────
+  describe("settlement – edge cases", function () {
+    it("reverts with RoundNotFound when roundId does not exist", async function () {
+      const fakeRoundId = 9999n;
+      // gameId exists (owner check passes), but round 9999 was never created (initialized = false)
+      await expect(
+        yieldPlay.connect(gameOwner).settlement(gameId, fakeRoundId)
+      ).to.be.revertedWithCustomError(yieldPlay, "RoundNotFound");
+    });
+
+    it("two rounds with the same token do not affect each other's settlement", async function () {
+      // ── Create round2 ────────────────────────────────────────────────────
+      const now       = BigInt(await time.latest());
+      const startTs2  = now + 10n;
+      const endTs2    = now + 86_400n;
+      const lockTime2 = 7n * 86_400n;
+
+      const roundId2 = await yieldPlay
+        .connect(gameOwner)
+        .createRound.staticCall(gameId, startTs2, endTs2, lockTime2);
+      await yieldPlay.connect(gameOwner).createRound(gameId, startTs2, endTs2, lockTime2);
+
+      // ── Users deposit into round2 ─────────────────────────────────────
+      await time.increaseTo(Number(startTs2) + 1);
+
+      await usdc.connect(whale).transfer(user1.address, USDC(500));
+      await usdc.connect(whale).transfer(user2.address, USDC(500));
+
+      await usdc.connect(user1).approve(await yieldPlay.getAddress(), USDC(200));
+      await usdc.connect(user2).approve(await yieldPlay.getAddress(), USDC(100));
+      await yieldPlay.connect(user1).deposit(gameId, roundId2, USDC(200));
+      await yieldPlay.connect(user2).deposit(gameId, roundId2, USDC(100));
+
+      // ── Snapshot round1 state before round2 settlement ──────────────
+      const round1Before = await yieldPlay.getRound(gameId, roundId);
+      expect(round1Before.isSettled).to.be.true; // sanity check
+
+      // ── Run full lifecycle for round2 ─────────────────────────────────
+      // Warp past endTs → Locking period (deposits closed, can deploy to vault)
+      await time.increaseTo(Number(endTs2) + 60);
+      await yieldPlay.connect(gameOwner).depositToVault(gameId, roundId2);
+
+      // Warp past endTs + lockTime → ChoosingWinners (can withdraw and settle)
+      await time.increaseTo(Number(endTs2) + Number(lockTime2) + 60);
+      await yieldPlay.connect(gameOwner).withdrawFromVault(gameId, roundId2);
+
+      await yieldPlay.connect(gameOwner).settlement(gameId, roundId2);
+
+      // ── Assert round1 state is completely unchanged ───────────────────
+      const round1After = await yieldPlay.getRound(gameId, roundId);
+      expect(round1After.totalWin).to.equal(
+        round1Before.totalWin,
+        "Round1 totalWin must not change after Round2 settlement"
+      );
+      expect(round1After.devFee).to.equal(
+        round1Before.devFee,
+        "Round1 devFee must not change after Round2 settlement"
+      );
+      expect(round1After.yieldAmount).to.equal(
+        round1Before.yieldAmount,
+        "Round1 yieldAmount must not change after Round2 settlement"
+      );
+
+      const round2After = await yieldPlay.getRound(gameId, roundId2);
+      expect(round2After.isSettled).to.be.true;
+
+      console.log(`  Round1 totalWin  : ${ethers.formatUnits(round1Before.totalWin, 6)} USDC (unchanged)`);
+      console.log(`  Round2 totalWin  : ${ethers.formatUnits(round2After.totalWin, 6)} USDC`);
+      console.log(`  Round1 yieldAmount: ${ethers.formatUnits(round1Before.yieldAmount, 6)} USDC (unchanged)`);
+    });
+  });
+
   after(async function () {
     // Stop impersonating
     await network.provider.request({ method: "hardhat_stopImpersonatingAccount", params: [USDC_WHALE] });
