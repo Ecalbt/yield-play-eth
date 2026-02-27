@@ -103,7 +103,6 @@ describe("YieldPlay – Avalanche mainnet fork (Euler eUSDC-19)", function () {
       .createGame(
         "ForkTestGame",
         500,           // 5% dev fee
-        100,           // 1% deposit fee → goes to bonus prize pool
         gameOwner.address,
         USDC_ADDRESS
       );
@@ -117,9 +116,9 @@ describe("YieldPlay – Avalanche mainnet fork (Euler eUSDC-19)", function () {
 
     roundId = await yieldPlay
       .connect(gameOwner)
-      .createRound.staticCall(gameId, startTs, endTs, lockTime);
+      .createRound.staticCall(gameId, startTs, endTs, lockTime, 100); // 1% deposit fee
 
-    await yieldPlay.connect(gameOwner).createRound(gameId, startTs, endTs, lockTime);
+    await yieldPlay.connect(gameOwner).createRound(gameId, startTs, endTs, lockTime, 100);
 
     const game  = await yieldPlay.getGame(gameId);
     const round = await yieldPlay.getRound(gameId, roundId);
@@ -268,8 +267,8 @@ describe("YieldPlay – Avalanche mainnet fork (Euler eUSDC-19)", function () {
 
       const roundId2 = await yieldPlay
         .connect(gameOwner)
-        .createRound.staticCall(gameId, startTs2, endTs2, lockTime2);
-      await yieldPlay.connect(gameOwner).createRound(gameId, startTs2, endTs2, lockTime2);
+        .createRound.staticCall(gameId, startTs2, endTs2, lockTime2, 100); // 1% deposit fee
+      await yieldPlay.connect(gameOwner).createRound(gameId, startTs2, endTs2, lockTime2, 100);
 
       // ── Users deposit into round2 ─────────────────────────────────────
       await time.increaseTo(Number(startTs2) + 1);

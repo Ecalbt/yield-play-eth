@@ -60,7 +60,6 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         address indexed owner,
         string gameName,
         uint16 devFeeBps,
-        uint16 depositFeeBps,
         address paymentToken
     );
     
@@ -69,7 +68,8 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         uint256 indexed roundId,
         uint64 startTs,
         uint64 endTs,
-        uint64 lockTime
+        uint64 lockTime,
+        uint16 depositFeeBps
     );
     
     event Deposited(
@@ -179,7 +179,6 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
      * @notice Create a new game
      * @param gameName Unique name for the game
      * @param devFeeBps Developer fee in basis points (max 10000)
-     * @param depositFeeBps Deposit fee in basis points - goes to prize pool (max 1000 = 10%)
      * @param treasury Address to receive developer fees
      * @param paymentToken ERC20 token accepted for deposits
      * @return gameId The unique identifier for the created game
@@ -187,12 +186,10 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
     function createGame(
         string calldata gameName,
         uint16 devFeeBps,
-        uint16 depositFeeBps,
         address treasury,
         address paymentToken
     ) external whenNotPaused returns (bytes32 gameId) {
         if (devFeeBps > BPS_DENOMINATOR) revert Errors.InvalidDevFeeBps();
-        if (depositFeeBps > 1000) revert Errors.InvalidDevFeeBps(); // Max 10% deposit fee
         if (paymentToken == address(0)) revert Errors.InvalidPaymentToken();
         if (treasury == address(0)) revert Errors.ZeroAddress();
         
@@ -204,14 +201,13 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
             owner: msg.sender,
             gameName: gameName,
             devFeeBps: devFeeBps,
-            depositFeeBps: depositFeeBps,
             treasury: treasury,
             roundCounter: 0,
             paymentToken: paymentToken,
             initialized: true
         });
         
-        emit GameCreated(gameId, msg.sender, gameName, devFeeBps, depositFeeBps, paymentToken);
+        emit GameCreated(gameId, msg.sender, gameName, devFeeBps, paymentToken);
     }
 
     // ============ Round Management ============
@@ -228,13 +224,15 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         bytes32 gameId,
         uint64 startTs,
         uint64 endTs,
-        uint64 lockTime
+        uint64 lockTime,
+        uint16 depositFeeBps
     ) external whenNotPaused returns (uint256 roundId) {
         Game storage game = games[gameId];
         
         if (!game.initialized) revert Errors.GameNotFound();
         if (msg.sender != game.owner) revert Errors.Unauthorized();
         if (endTs <= startTs) revert Errors.InvalidRoundTime();
+        if (depositFeeBps > 1000) revert Errors.InvalidDevFeeBps(); // Max 10% deposit fee
         
         roundId = game.roundCounter;
         
@@ -246,6 +244,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
             devFee: 0,
             totalWin: 0,
             yieldAmount: 0,
+            depositFeeBps: depositFeeBps,
             startTs: startTs,
             endTs: endTs,
             lockTime: lockTime,
@@ -257,7 +256,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         
         game.roundCounter++;
         
-        emit RoundCreated(gameId, roundId, startTs, endTs, lockTime);
+        emit RoundCreated(gameId, roundId, startTs, endTs, lockTime, depositFeeBps);
     }
     
     /**
@@ -312,7 +311,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         IERC20(game.paymentToken).safeTransferFrom(msg.sender, address(this), amount);
         
         // Calculate deposit fee (goes to bonus prize pool)
-        uint256 depositFee = (amount * game.depositFeeBps) / BPS_DENOMINATOR;
+        uint256 depositFee = (amount * round.depositFeeBps) / BPS_DENOMINATOR;
         uint256 netDeposit = amount - depositFee;
         
         // Update round state

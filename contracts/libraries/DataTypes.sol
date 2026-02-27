@@ -21,7 +21,6 @@ struct Game {
     address owner;           // Game creator/admin
     string gameName;         // Unique identifier
     uint16 devFeeBps;        // Developer fee in basis points (max 10000)
-    uint16 depositFeeBps;    // Deposit fee in basis points - goes to prize pool
     address treasury;        // Treasury address for dev fees
     uint256 roundCounter;    // Auto-incrementing round ID
     address paymentToken;    // Accepted ERC20 token
@@ -40,6 +39,7 @@ struct Round {
     uint256 devFee;          // Accumulated dev fees
     uint256 totalWin;        // Remaining prize pool to distribute
     uint256 yieldAmount;     // Total yield generated from vault
+    uint16 depositFeeBps;    // Deposit fee in basis points - goes to prize pool
     uint64 startTs;          // Round start timestamp
     uint64 endTs;            // Round end timestamp (deposits close)
     uint64 lockTime;         // Additional lock period after end
