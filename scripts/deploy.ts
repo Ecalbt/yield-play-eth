@@ -1,7 +1,11 @@
 import { ethers } from "hardhat";
 
 async function main() {
-  const [deployer] = await ethers.getSigners();
+  const signers = await ethers.getSigners();
+  if (signers.length === 0) {
+    throw new Error("No signers available. Make sure you're running 'npx hardhat node' first, or use --network hardhat");
+  }
+  const [deployer] = signers;
   console.log("Deploying contracts with the account:", deployer.address);
 
   const balance = await ethers.provider.getBalance(deployer.address);

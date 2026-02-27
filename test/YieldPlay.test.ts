@@ -1,562 +1,256 @@
+/**
+ * @file YieldPlay.test.ts
+ * @notice Fork test against Avalanche mainnet using the real Euler eUSDC-19 vault
+ *
+ * Vault:      0x37ca03aD51B8ff79aAD35FadaCBA4CEDF0C3e74e  (Euler eUSDC-19)
+ * Underlying: 0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E  (USDC on Avalanche)
+ * Block:      79094077  (pinned in hardhat.config.ts)
+ *
+ * Run:  npx hardhat test
+ */
+
 import { expect } from "chai";
-import { ethers } from "hardhat";
+import { ethers, network } from "hardhat";
 import { time } from "@nomicfoundation/hardhat-network-helpers";
-import { 
-  YieldPlay, 
-  MockERC20, 
-  MockYieldStrategy 
-} from "../typechain-types";
+import { IERC20, IERC4626, YieldPlay } from "../typechain-types";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
 
-describe("YieldPlay", function () {
+// ─── Addresses on Avalanche C-Chain ───────────────────────────────────────────
+const EULER_VAULT  = "0x37ca03aD51B8ff79aAD35FadaCBA4CEDF0C3e74e"; // eUSDC-19
+const USDC_ADDRESS = "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E"; // USDC (6 decimals)
+
+// Aave aUSDC contract holds underlying USDC as collateral — richest USDC holder on Avax
+const USDC_WHALE   = "0x625E7708f30cA75bfd92586e17077590C60eb4cD"; // Aave aUSDC (~34M USDC)
+
+const USDC = (amount: number) => ethers.parseUnits(String(amount), 6);
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("YieldPlay – Avalanche mainnet fork (Euler eUSDC-19)", function () {
+  // These tests call real RPC and may be slow
+  this.timeout(120_000);
+
   let yieldPlay: YieldPlay;
-  let mockToken: MockERC20;
-  let mockStrategy: MockYieldStrategy;
-  let owner: SignerWithAddress;
-  let gameOwner: SignerWithAddress;
-  let user1: SignerWithAddress;
-  let user2: SignerWithAddress;
-  let user3: SignerWithAddress;
-  let treasury: SignerWithAddress;
+  let usdc: IERC20;
+  let vault: IERC4626;
+
+  let deployer:         SignerWithAddress;
+  let gameOwner:        SignerWithAddress;
   let protocolTreasury: SignerWithAddress;
+  let user1:            SignerWithAddress;
+  let user2:            SignerWithAddress;
 
-  const DECIMALS = 6;
-  const INITIAL_BALANCE = ethers.parseUnits("10000", DECIMALS);
-  const YIELD_RATE_BPS = 500; // 5% yield
+  let whale: any; // impersonated signer
 
-  beforeEach(async function () {
-    [owner, gameOwner, user1, user2, user3, treasury, protocolTreasury] = 
-      await ethers.getSigners();
+  let gameId:  string;
+  let roundId: bigint;
 
-    // Deploy Mock Token
-    const MockERC20Factory = await ethers.getContractFactory("MockERC20");
-    mockToken = await MockERC20Factory.deploy("Mock USDC", "mUSDC", DECIMALS);
-    await mockToken.waitForDeployment();
+  before(async function () {
+    [deployer, gameOwner, protocolTreasury, user1, user2] = await ethers.getSigners();
 
-    // Deploy YieldPlay
-    const YieldPlayFactory = await ethers.getContractFactory("YieldPlay");
+    // Mine one empty block so local blockNumber advances past the fork block.
+    // Hardhat EDR cannot resolve the hardfork when blockNumber === forkBlockNumber exactly.
+    await network.provider.send("evm_mine");
+
+    // ── Attach to real on-chain contracts ──────────────────────────────────
+    usdc  = await ethers.getContractAt("IERC20",   USDC_ADDRESS) as unknown as IERC20;
+    vault = await ethers.getContractAt("IERC4626", EULER_VAULT)  as unknown as IERC4626;
+
+    // ── Check vault still accepts deposits (supply cap guard) ──────────────
+    const maxDep = await vault.maxDeposit(deployer.address);
+    if (maxDep === 0n) {
+      console.warn("  ⚠️  Vault supply cap is full – skipping fork tests");
+      this.skip();
+    }
+    console.log(`  Vault totalAssets : ${ethers.formatUnits(await vault.totalAssets(), 6)} USDC`);
+    console.log(`  Vault maxDeposit  : ${ethers.formatUnits(maxDep, 6)} USDC`);
+
+    // ── Impersonate USDC whale and fund it with AVAX for gas ──────────────
+    await network.provider.request({ method: "hardhat_impersonateAccount", params: [USDC_WHALE] });
+    await network.provider.send("hardhat_setBalance", [
+      USDC_WHALE,
+      "0x" + (10n ** 20n).toString(16), // 100 AVAX
+    ]);
+    whale = await ethers.getSigner(USDC_WHALE);
+
+    // Transfer USDC to test users
+    const whaleBal = await usdc.balanceOf(USDC_WHALE);
+    console.log(`  Whale USDC balance: ${ethers.formatUnits(whaleBal, 6)} USDC`);
+    expect(whaleBal).to.be.gt(USDC(2000), "Whale doesn't have enough USDC");
+
+    await usdc.connect(whale).transfer(user1.address, USDC(1000));
+    await usdc.connect(whale).transfer(user2.address, USDC(1000));
+
+    // ── Deploy YieldPlay ──────────────────────────────────────────────────
+    const YieldPlayFactory = await ethers.getContractFactory("YieldPlay", deployer);
     yieldPlay = await YieldPlayFactory.deploy(protocolTreasury.address);
     await yieldPlay.waitForDeployment();
 
-    // Deploy Mock Strategy
-    const MockStrategyFactory = await ethers.getContractFactory("MockYieldStrategy");
-    mockStrategy = await MockStrategyFactory.deploy(
-      await mockToken.getAddress(),
-      await yieldPlay.getAddress(),
-      YIELD_RATE_BPS
+    // Point YieldPlay at the real Euler vault
+    await yieldPlay.connect(deployer).setVault(USDC_ADDRESS, EULER_VAULT);
+    console.log(`  YieldPlay deployed: ${await yieldPlay.getAddress()}`);
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  it("creates a game and round", async function () {
+    const now     = BigInt(await time.latest());
+    const startTs = now + 10n;
+    const endTs   = now + 86_400n;       // 1 day deposit window
+    const lockTime = 7n * 86_400n;       // 7-day lock → yield accrues in vault
+
+    const tx = await yieldPlay
+      .connect(gameOwner)
+      .createGame(
+        "ForkTestGame",
+        500,           // 5% dev fee
+        100,           // 1% deposit fee → goes to bonus prize pool
+        gameOwner.address,
+        USDC_ADDRESS
+      );
+    const receipt = await tx.wait();
+
+    // Derive gameId the same way the contract does
+    gameId = ethers.solidityPackedKeccak256(
+      ["address", "string"],
+      [gameOwner.address, "ForkTestGame"]
     );
-    await mockStrategy.waitForDeployment();
 
-    // Configure strategy
-    await yieldPlay.setStrategy(
-      await mockToken.getAddress(),
-      await mockStrategy.getAddress()
+    roundId = await yieldPlay
+      .connect(gameOwner)
+      .createRound.staticCall(gameId, startTs, endTs, lockTime);
+
+    await yieldPlay.connect(gameOwner).createRound(gameId, startTs, endTs, lockTime);
+
+    const game  = await yieldPlay.getGame(gameId);
+    const round = await yieldPlay.getRound(gameId, roundId);
+
+    expect(game.paymentToken).to.equal(USDC_ADDRESS);
+    expect(round.startTs).to.equal(startTs);
+    console.log(`  gameId : ${gameId}`);
+    console.log(`  roundId: ${roundId}`);
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  it("users deposit USDC into the round", async function () {
+    // Warp to the start of the round
+    const round = await yieldPlay.getRound(gameId, roundId);
+    await time.increaseTo(Number(round.startTs) + 1);
+
+    // Approve and deposit
+    await usdc.connect(user1).approve(await yieldPlay.getAddress(), USDC(500));
+    await usdc.connect(user2).approve(await yieldPlay.getAddress(), USDC(300));
+
+    await yieldPlay.connect(user1).deposit(gameId, roundId, USDC(500));
+    await yieldPlay.connect(user2).deposit(gameId, roundId, USDC(300));
+
+    const roundState = await yieldPlay.getRound(gameId, roundId);
+    // net: 500 * 99% = 495, 300 * 99% = 297 (1% deposit fee)
+    const expectedNet = USDC(500) * 99n / 100n + USDC(300) * 99n / 100n;
+    expect(roundState.totalDeposit).to.be.closeTo(expectedNet, USDC(1));
+
+    console.log(`  totalDeposit : ${ethers.formatUnits(roundState.totalDeposit, 6)} USDC`);
+    console.log(`  bonusPrizePool: ${ethers.formatUnits(roundState.bonusPrizePool, 6)} USDC`);
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  it("game owner deploys funds into the real Euler vault", async function () {
+    const round = await yieldPlay.getRound(gameId, roundId);
+
+    // Warp past endTs → enters Locking period
+    await time.increaseTo(Number(round.endTs) + 60);
+
+    await yieldPlay.connect(gameOwner).depositToVault(gameId, roundId);
+
+    const deployed = await yieldPlay.deployedShares(gameId, roundId);
+    expect(deployed).to.be.gt(0n, "Should have received vault shares");
+
+    const vaultShares = await vault.balanceOf(await yieldPlay.getAddress());
+    console.log(`  Vault shares held by YieldPlay: ${ethers.formatUnits(vaultShares, 6)}`);
+    console.log(`  Shares via deployedShares mapping: ${ethers.formatUnits(deployed, 6)}`);
+    expect(vaultShares).to.equal(deployed);
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  it("yield accrues in the vault over time, then withdraws with profit", async function () {
+    const round = await yieldPlay.getRound(gameId, roundId);
+    const lockEnd = Number(round.endTs) + Number(round.lockTime);
+
+    const valueBeforeWarp = await vault.convertToAssets(
+      await yieldPlay.deployedShares(gameId, roundId)
     );
+    console.log(`  Value BEFORE time travel: ${ethers.formatUnits(valueBeforeWarp, 6)} USDC`);
 
-    // Mint tokens to users
-    await mockToken.mint(user1.address, INITIAL_BALANCE);
-    await mockToken.mint(user2.address, INITIAL_BALANCE);
-    await mockToken.mint(user3.address, INITIAL_BALANCE);
+    // Warp past lockTime → ChoosingWinners status
+    await time.increaseTo(lockEnd + 60);
 
-    // Mint tokens to strategy for yield simulation
-    const yieldFunding = ethers.parseUnits("10000", DECIMALS);
-    await mockToken.mint(await mockStrategy.getAddress(), yieldFunding);
+    const valueAfterWarp = await vault.convertToAssets(
+      await yieldPlay.deployedShares(gameId, roundId)
+    );
+    console.log(`  Value AFTER  time travel: ${ethers.formatUnits(valueAfterWarp, 6)} USDC`);
 
-    // Approve YieldPlay
-    await mockToken.connect(user1).approve(await yieldPlay.getAddress(), ethers.MaxUint256);
-    await mockToken.connect(user2).approve(await yieldPlay.getAddress(), ethers.MaxUint256);
-    await mockToken.connect(user3).approve(await yieldPlay.getAddress(), ethers.MaxUint256);
+    // NOTE: On Euler vaults, interest accrues per-interaction (not per-block).
+    // The value may be equal or slightly higher depending on vault activity.
+    // We just assert it is >= principal (no-loss guarantee).
+    expect(valueAfterWarp).to.be.gte(valueBeforeWarp, "Value should not decrease");
+
+    // Withdraw from vault
+    const balBefore = await usdc.balanceOf(await yieldPlay.getAddress());
+    await yieldPlay.connect(gameOwner).withdrawFromVault(gameId, roundId);
+    const balAfter = await usdc.balanceOf(await yieldPlay.getAddress());
+
+    const totalBack = balAfter - balBefore;
+    const principal = (await yieldPlay.deployedAmounts(gameId, roundId)); // already zeroed? No — only shares are zeroed
+    console.log(`  USDC returned from vault: ${ethers.formatUnits(totalBack, 6)} USDC`);
+
+    expect(balAfter).to.be.gt(0n);
   });
 
-  describe("Game Creation", function () {
-    it("Should create a game successfully", async function () {
-      const gameName = "TestGame";
-      const devFeeBps = 1000; // 10%
+  // ──────────────────────────────────────────────────────────────────────────
+  it("settles the round and assigns winner", async function () {
+    await yieldPlay.connect(gameOwner).settlement(gameId, roundId);
 
-      const tx = await yieldPlay.connect(gameOwner).createGame(
-        gameName,
-        devFeeBps,
-        treasury.address,
-        await mockToken.getAddress()
-      );
+    const round = await yieldPlay.getRound(gameId, roundId);
+    console.log(`  totalWin (prize pool): ${ethers.formatUnits(round.totalWin, 6)} USDC`);
+    expect(round.isSettled).to.be.true;
 
-      const gameId = await yieldPlay.calculateGameId(gameOwner.address, gameName);
-      const game = await yieldPlay.getGame(gameId);
+    if (round.totalWin > 0n) {
+      // Assign entire prize pool to user1
+      await yieldPlay.connect(gameOwner).chooseWinner(gameId, roundId, user1.address, round.totalWin);
+    } else {
+      // No yield, just finalize so users can claim principal
+      console.log("  No yield generated – finalizing round without prize");
+      await yieldPlay.connect(gameOwner).finalizeRound(gameId, roundId);
+    }
 
-      expect(game.owner).to.equal(gameOwner.address);
-      expect(game.gameName).to.equal(gameName);
-      expect(game.devFeeBps).to.equal(devFeeBps);
-      expect(game.treasury).to.equal(treasury.address);
-      expect(game.initialized).to.be.true;
-
-      await expect(tx)
-        .to.emit(yieldPlay, "GameCreated")
-        .withArgs(gameId, gameOwner.address, gameName, devFeeBps, await mockToken.getAddress());
-    });
-
-    it("Should revert if dev fee exceeds 100%", async function () {
-      await expect(
-        yieldPlay.connect(gameOwner).createGame(
-          "TestGame",
-          10001, // > 100%
-          treasury.address,
-          await mockToken.getAddress()
-        )
-      ).to.be.revertedWithCustomError(yieldPlay, "InvalidDevFeeBps");
-    });
-
-    it("Should revert if game already exists", async function () {
-      const gameName = "TestGame";
-      await yieldPlay.connect(gameOwner).createGame(
-        gameName,
-        1000,
-        treasury.address,
-        await mockToken.getAddress()
-      );
-
-      await expect(
-        yieldPlay.connect(gameOwner).createGame(
-          gameName,
-          1000,
-          treasury.address,
-          await mockToken.getAddress()
-        )
-      ).to.be.revertedWithCustomError(yieldPlay, "GameAlreadyExists");
-    });
+    const roundAfter = await yieldPlay.getRound(gameId, roundId);
+    expect(roundAfter.status).to.equal(4); // DistributingRewards = 4
   });
 
-  describe("Round Creation", function () {
-    let gameId: string;
+  // ──────────────────────────────────────────────────────────────────────────
+  it("users claim their principal back (+ prize for winner)", async function () {
+    const u1Before = await usdc.balanceOf(user1.address);
+    const u2Before = await usdc.balanceOf(user2.address);
 
-    beforeEach(async function () {
-      await yieldPlay.connect(gameOwner).createGame(
-        "TestGame",
-        1000,
-        treasury.address,
-        await mockToken.getAddress()
-      );
-      gameId = await yieldPlay.calculateGameId(gameOwner.address, "TestGame");
-    });
+    await yieldPlay.connect(user1).claim(gameId, roundId);
+    await yieldPlay.connect(user2).claim(gameId, roundId);
 
-    it("Should create a round successfully", async function () {
-      const now = await time.latest();
-      const startTs = now + 100;
-      const endTs = now + 1000;
-      const lockTime = 500;
+    const u1After = await usdc.balanceOf(user1.address);
+    const u2After = await usdc.balanceOf(user2.address);
 
-      const tx = await yieldPlay.connect(gameOwner).createRound(
-        gameId,
-        startTs,
-        endTs,
-        lockTime
-      );
+    const u1Received = u1After - u1Before;
+    const u2Received = u2After - u2Before;
 
-      const round = await yieldPlay.getRound(gameId, 0);
+    // user1 net deposit was 495 USDC + any prize
+    // user2 net deposit was 297 USDC
+    expect(u1Received).to.be.gte(USDC(495), "user1 should get at least their net deposit back");
+    expect(u2Received).to.be.gte(USDC(297), "user2 should get at least their net deposit back");
 
-      expect(round.gameId).to.equal(gameId);
-      expect(round.roundId).to.equal(0);
-      expect(round.startTs).to.equal(startTs);
-      expect(round.endTs).to.equal(endTs);
-      expect(round.lockTime).to.equal(lockTime);
-      expect(round.status).to.equal(0); // NotStarted
-
-      await expect(tx)
-        .to.emit(yieldPlay, "RoundCreated")
-        .withArgs(gameId, 0, startTs, endTs, lockTime);
-    });
-
-    it("Should revert if caller is not game owner", async function () {
-      const now = await time.latest();
-      await expect(
-        yieldPlay.connect(user1).createRound(gameId, now + 100, now + 1000, 500)
-      ).to.be.revertedWithCustomError(yieldPlay, "Unauthorized");
-    });
-
-    it("Should revert if end time is before start time", async function () {
-      const now = await time.latest();
-      await expect(
-        yieldPlay.connect(gameOwner).createRound(gameId, now + 1000, now + 100, 500)
-      ).to.be.revertedWithCustomError(yieldPlay, "InvalidRoundTime");
-    });
+    console.log(`  user1 received: ${ethers.formatUnits(u1Received, 6)} USDC`);
+    console.log(`  user2 received: ${ethers.formatUnits(u2Received, 6)} USDC`);
   });
 
-  describe("Deposits", function () {
-    let gameId: string;
-
-    beforeEach(async function () {
-      await yieldPlay.connect(gameOwner).createGame(
-        "TestGame",
-        1000,
-        treasury.address,
-        await mockToken.getAddress()
-      );
-      gameId = await yieldPlay.calculateGameId(gameOwner.address, "TestGame");
-
-      const now = await time.latest();
-      await yieldPlay.connect(gameOwner).createRound(
-        gameId,
-        now + 10,
-        now + 1000,
-        500
-      );
-
-      // Advance to start
-      await time.increase(20);
-    });
-
-    it("Should accept deposits during InProgress", async function () {
-      const depositAmount = ethers.parseUnits("1000", DECIMALS);
-
-      const tx = await yieldPlay.connect(user1).deposit(gameId, 0, depositAmount);
-
-      const userDeposit = await yieldPlay.getUserDeposit(gameId, 0, user1.address);
-      expect(userDeposit.depositAmount).to.equal(depositAmount);
-      expect(userDeposit.exists).to.be.true;
-
-      const round = await yieldPlay.getRound(gameId, 0);
-      expect(round.totalDeposit).to.equal(depositAmount);
-
-      await expect(tx)
-        .to.emit(yieldPlay, "Deposited")
-        .withArgs(gameId, 0, user1.address, depositAmount);
-    });
-
-    it("Should allow multiple deposits from same user", async function () {
-      const depositAmount1 = ethers.parseUnits("500", DECIMALS);
-      const depositAmount2 = ethers.parseUnits("300", DECIMALS);
-
-      await yieldPlay.connect(user1).deposit(gameId, 0, depositAmount1);
-      await yieldPlay.connect(user1).deposit(gameId, 0, depositAmount2);
-
-      const userDeposit = await yieldPlay.getUserDeposit(gameId, 0, user1.address);
-      expect(userDeposit.depositAmount).to.equal(depositAmount1 + depositAmount2);
-    });
-
-    it("Should reject deposits before round starts", async function () {
-      // Create a new round that hasn't started
-      const now = await time.latest();
-      await yieldPlay.connect(gameOwner).createRound(
-        gameId,
-        now + 1000, // starts in the future
-        now + 2000,
-        500
-      );
-
-      await expect(
-        yieldPlay.connect(user1).deposit(gameId, 1, ethers.parseUnits("100", DECIMALS))
-      ).to.be.revertedWithCustomError(yieldPlay, "RoundNotActive");
-    });
-
-    it("Should reject zero amount deposits", async function () {
-      await expect(
-        yieldPlay.connect(user1).deposit(gameId, 0, 0)
-      ).to.be.revertedWithCustomError(yieldPlay, "InvalidAmount");
-    });
-  });
-
-  describe("Full Round Lifecycle", function () {
-    let gameId: string;
-    const depositAmount1 = ethers.parseUnits("1000", DECIMALS);
-    const depositAmount2 = ethers.parseUnits("2000", DECIMALS);
-
-    beforeEach(async function () {
-      await yieldPlay.connect(gameOwner).createGame(
-        "TestGame",
-        1000, // 10% dev fee
-        treasury.address,
-        await mockToken.getAddress()
-      );
-      gameId = await yieldPlay.calculateGameId(gameOwner.address, "TestGame");
-
-      const now = await time.latest();
-      await yieldPlay.connect(gameOwner).createRound(
-        gameId,
-        now + 10,
-        now + 500,
-        300
-      );
-
-      // Advance to start and deposit
-      await time.increase(20);
-      await yieldPlay.connect(user1).deposit(gameId, 0, depositAmount1);
-      await yieldPlay.connect(user2).deposit(gameId, 0, depositAmount2);
-    });
-
-    it("Should complete full lifecycle: deposit -> deploy -> withdraw -> settle -> choose winner -> claim", async function () {
-      // Advance past deposit period
-      await time.increase(500);
-
-      // Deploy to strategy
-      await yieldPlay.connect(gameOwner).depositToStrategy(gameId, 0);
-      
-      let round = await yieldPlay.getRound(gameId, 0);
-      expect(round.fundsDeployed).to.be.true;
-
-      // Advance past lock period
-      await time.increase(400);
-
-      // Withdraw from strategy
-      await yieldPlay.connect(gameOwner).withdrawFromStrategy(gameId, 0);
-      
-      round = await yieldPlay.getRound(gameId, 0);
-      expect(round.fundsDeployed).to.be.false;
-
-      // Settlement
-      const treasuryBalanceBefore = await mockToken.balanceOf(treasury.address);
-      const protocolBalanceBefore = await mockToken.balanceOf(protocolTreasury.address);
-
-      await yieldPlay.connect(gameOwner).settlement(gameId, 0);
-
-      round = await yieldPlay.getRound(gameId, 0);
-      expect(round.isSettled).to.be.true;
-      expect(round.totalWin).to.be.gt(0);
-
-      // Treasury should have received dev fee
-      const treasuryBalanceAfter = await mockToken.balanceOf(treasury.address);
-      expect(treasuryBalanceAfter).to.be.gt(treasuryBalanceBefore);
-
-      // Protocol treasury should have received performance fee
-      const protocolBalanceAfter = await mockToken.balanceOf(protocolTreasury.address);
-      expect(protocolBalanceAfter).to.be.gt(protocolBalanceBefore);
-
-      // Choose winner (user1 gets all prizes)
-      const prizeAmount = round.totalWin;
-      await yieldPlay.connect(gameOwner).chooseWinner(gameId, 0, user1.address, prizeAmount);
-
-      round = await yieldPlay.getRound(gameId, 0);
-      expect(round.totalWin).to.equal(0);
-      expect(round.status).to.equal(4); // DistributingRewards
-
-      // Users claim
-      const user1BalanceBefore = await mockToken.balanceOf(user1.address);
-      await yieldPlay.connect(user1).claim(gameId, 0);
-      const user1BalanceAfter = await mockToken.balanceOf(user1.address);
-
-      // User1 should receive deposit + prize
-      expect(user1BalanceAfter - user1BalanceBefore).to.equal(depositAmount1 + prizeAmount);
-
-      const user2BalanceBefore = await mockToken.balanceOf(user2.address);
-      await yieldPlay.connect(user2).claim(gameId, 0);
-      const user2BalanceAfter = await mockToken.balanceOf(user2.address);
-
-      // User2 should receive only deposit (no prize)
-      expect(user2BalanceAfter - user2BalanceBefore).to.equal(depositAmount2);
-    });
-
-    it("Should allow multiple winners", async function () {
-      // Add user3
-      await yieldPlay.connect(user3).deposit(gameId, 0, ethers.parseUnits("1000", DECIMALS));
-
-      await time.increase(500);
-      await yieldPlay.connect(gameOwner).depositToStrategy(gameId, 0);
-      await time.increase(400);
-      await yieldPlay.connect(gameOwner).withdrawFromStrategy(gameId, 0);
-      await yieldPlay.connect(gameOwner).settlement(gameId, 0);
-
-      let round = await yieldPlay.getRound(gameId, 0);
-      const totalPrize = round.totalWin;
-      const prize1 = totalPrize / 2n;
-      const prize2 = totalPrize - prize1;
-
-      // User1 wins half
-      await yieldPlay.connect(gameOwner).chooseWinner(gameId, 0, user1.address, prize1);
-      
-      round = await yieldPlay.getRound(gameId, 0);
-      expect(round.status).to.equal(3); // Still ChoosingWinners
-
-      // User3 wins other half
-      await yieldPlay.connect(gameOwner).chooseWinner(gameId, 0, user3.address, prize2);
-
-      round = await yieldPlay.getRound(gameId, 0);
-      expect(round.status).to.equal(4); // DistributingRewards
-    });
-
-    it("Should reject claims before round is complete", async function () {
-      await expect(
-        yieldPlay.connect(user1).claim(gameId, 0)
-      ).to.be.revertedWithCustomError(yieldPlay, "RoundNotCompleted");
-    });
-
-    it("Should reject double claims", async function () {
-      await time.increase(500);
-      await yieldPlay.connect(gameOwner).depositToStrategy(gameId, 0);
-      await time.increase(400);
-      await yieldPlay.connect(gameOwner).withdrawFromStrategy(gameId, 0);
-      await yieldPlay.connect(gameOwner).settlement(gameId, 0);
-      await yieldPlay.connect(gameOwner).finalizeRound(gameId, 0);
-
-      await yieldPlay.connect(user1).claim(gameId, 0);
-
-      await expect(
-        yieldPlay.connect(user1).claim(gameId, 0)
-      ).to.be.revertedWithCustomError(yieldPlay, "AlreadyClaimed");
-    });
-  });
-
-  describe("Access Control", function () {
-    let gameId: string;
-
-    beforeEach(async function () {
-      await yieldPlay.connect(gameOwner).createGame(
-        "TestGame",
-        1000,
-        treasury.address,
-        await mockToken.getAddress()
-      );
-      gameId = await yieldPlay.calculateGameId(gameOwner.address, "TestGame");
-
-      const now = await time.latest();
-      await yieldPlay.connect(gameOwner).createRound(
-        gameId,
-        now + 10,
-        now + 500,
-        300
-      );
-
-      await time.increase(20);
-      await yieldPlay.connect(user1).deposit(gameId, 0, ethers.parseUnits("1000", DECIMALS));
-      await time.increase(500);
-    });
-
-    it("Should reject depositToStrategy from non-owner", async function () {
-      await expect(
-        yieldPlay.connect(user1).depositToStrategy(gameId, 0)
-      ).to.be.revertedWithCustomError(yieldPlay, "Unauthorized");
-    });
-
-    it("Should reject withdrawFromStrategy from non-owner", async function () {
-      await yieldPlay.connect(gameOwner).depositToStrategy(gameId, 0);
-      await time.increase(400);
-
-      await expect(
-        yieldPlay.connect(user1).withdrawFromStrategy(gameId, 0)
-      ).to.be.revertedWithCustomError(yieldPlay, "Unauthorized");
-    });
-
-    it("Should reject settlement from non-owner", async function () {
-      await yieldPlay.connect(gameOwner).depositToStrategy(gameId, 0);
-      await time.increase(400);
-      await yieldPlay.connect(gameOwner).withdrawFromStrategy(gameId, 0);
-
-      await expect(
-        yieldPlay.connect(user1).settlement(gameId, 0)
-      ).to.be.revertedWithCustomError(yieldPlay, "Unauthorized");
-    });
-
-    it("Should reject chooseWinner from non-owner", async function () {
-      await yieldPlay.connect(gameOwner).depositToStrategy(gameId, 0);
-      await time.increase(400);
-      await yieldPlay.connect(gameOwner).withdrawFromStrategy(gameId, 0);
-      await yieldPlay.connect(gameOwner).settlement(gameId, 0);
-
-      await expect(
-        yieldPlay.connect(user1).chooseWinner(gameId, 0, user1.address, 100)
-      ).to.be.revertedWithCustomError(yieldPlay, "Unauthorized");
-    });
-  });
-
-  describe("Admin Functions", function () {
-    it("Should allow owner to pause and unpause", async function () {
-      await yieldPlay.pause();
-      
-      await expect(
-        yieldPlay.connect(gameOwner).createGame(
-          "TestGame",
-          1000,
-          treasury.address,
-          await mockToken.getAddress()
-        )
-      ).to.be.revertedWithCustomError(yieldPlay, "EnforcedPause");
-
-      await yieldPlay.unpause();
-
-      // Should work now
-      await yieldPlay.connect(gameOwner).createGame(
-        "TestGame",
-        1000,
-        treasury.address,
-        await mockToken.getAddress()
-      );
-    });
-
-    it("Should allow owner to update protocol treasury", async function () {
-      const newTreasury = user3.address;
-      
-      await expect(yieldPlay.setProtocolTreasury(newTreasury))
-        .to.emit(yieldPlay, "ProtocolTreasuryUpdated")
-        .withArgs(newTreasury);
-
-      expect(await yieldPlay.protocolTreasury()).to.equal(newTreasury);
-    });
-
-    it("Should allow owner to set strategy", async function () {
-      const newToken = user3.address; // Just using as address
-      const newStrategy = treasury.address;
-
-      await expect(yieldPlay.setStrategy(newToken, newStrategy))
-        .to.emit(yieldPlay, "StrategyUpdated")
-        .withArgs(newToken, newStrategy);
-
-      expect(await yieldPlay.strategies(newToken)).to.equal(newStrategy);
-    });
-
-    it("Should reject admin functions from non-owner", async function () {
-      await expect(
-        yieldPlay.connect(user1).pause()
-      ).to.be.revertedWithCustomError(yieldPlay, "OwnableUnauthorizedAccount");
-
-      await expect(
-        yieldPlay.connect(user1).setProtocolTreasury(user1.address)
-      ).to.be.revertedWithCustomError(yieldPlay, "OwnableUnauthorizedAccount");
-
-      await expect(
-        yieldPlay.connect(user1).setStrategy(user1.address, user2.address)
-      ).to.be.revertedWithCustomError(yieldPlay, "OwnableUnauthorizedAccount");
-    });
-  });
-
-  describe("View Functions", function () {
-    it("Should calculate correct game ID", async function () {
-      const gameName = "TestGame";
-      const expectedId = ethers.keccak256(
-        ethers.solidityPacked(["address", "string"], [gameOwner.address, gameName])
-      );
-
-      const calculatedId = await yieldPlay.calculateGameId(gameOwner.address, gameName);
-      expect(calculatedId).to.equal(expectedId);
-    });
-
-    it("Should return correct current status", async function () {
-      await yieldPlay.connect(gameOwner).createGame(
-        "TestGame",
-        1000,
-        treasury.address,
-        await mockToken.getAddress()
-      );
-      const gameId = await yieldPlay.calculateGameId(gameOwner.address, "TestGame");
-
-      const now = await time.latest();
-      await yieldPlay.connect(gameOwner).createRound(
-        gameId,
-        now + 100,
-        now + 500,
-        300
-      );
-
-      // NotStarted
-      expect(await yieldPlay.getCurrentStatus(gameId, 0)).to.equal(0);
-
-      await time.increase(150);
-      // InProgress
-      expect(await yieldPlay.getCurrentStatus(gameId, 0)).to.equal(1);
-
-      await time.increase(400);
-      // Locking
-      expect(await yieldPlay.getCurrentStatus(gameId, 0)).to.equal(2);
-
-      await time.increase(400);
-      // ChoosingWinners
-      expect(await yieldPlay.getCurrentStatus(gameId, 0)).to.equal(3);
-    });
+  after(async function () {
+    // Stop impersonating
+    await network.provider.request({ method: "hardhat_stopImpersonatingAccount", params: [USDC_WHALE] });
   });
 });

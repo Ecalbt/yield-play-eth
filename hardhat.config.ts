@@ -19,11 +19,14 @@ const config: HardhatUserConfig = {
   },
   networks: {
     hardhat: {
-      chainId: 31337,
+      forking: {
+        url: "https://avalanche.gateway.tenderly.co/5dn7B5iomBLt5oW6FMLllJ",
+        blockNumber: 79094077,
+      },
     },
     localhost: {
-      url: "http://127.0.0.1:8545",
-      chainId: 31337,
+      url: "https://avalanche.gateway.tenderly.co/5dn7B5iomBLt5oW6FMLllJ",
+      chainId: 43114,
     },
     sepolia: {
       url: process.env.SEPOLIA_RPC_URL || "",
@@ -39,6 +42,11 @@ const config: HardhatUserConfig = {
       url: process.env.ARBITRUM_SEPOLIA_RPC_URL || "https://sepolia-rollup.arbitrum.io/rpc",
       accounts: [PRIVATE_KEY],
       chainId: 421614,
+    },
+    avalancheCChainFork: {
+      url: process.env.AVALANCHE_C_CHAIN_RPC_URL || "https://avalanche.gateway.tenderly.co/5dn7B5iomBLt5oW6FMLllJ",
+      accounts: [PRIVATE_KEY],
+      chainId: 43114,
     },
   },
   etherscan: {

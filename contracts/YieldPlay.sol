@@ -3,11 +3,11 @@ pragma solidity ^0.8.20;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 
-import {IYieldStrategy} from "./interfaces/IYieldStrategy.sol";
 import {Game, Round, UserDeposit, RoundStatus} from "./libraries/DataTypes.sol";
 import {Errors} from "./libraries/Errors.sol";
 
@@ -17,7 +17,7 @@ import {Errors} from "./libraries/Errors.sol";
  * @notice A no-loss prize game protocol where depositors' funds generate yield
  *         that is distributed to selected winners while principals are returned.
  * @dev This contract manages multiple games, each with multiple rounds.
- *      Funds are deployed to external yield strategies during the lock period.
+ *      Funds are deployed to ERC4626 vaults to generate yield during the lock period.
  */
 contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
     using SafeERC20 for IERC20;
@@ -44,11 +44,14 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
     /// @notice Mapping from gameId => roundId => user => UserDeposit
     mapping(bytes32 => mapping(uint256 => mapping(address => UserDeposit))) public userDeposits;
     
-    /// @notice Mapping from payment token => yield strategy
-    mapping(address => address) public strategies;
+    /// @notice Mapping from payment token => ERC4626 vault
+    mapping(address => address) public vaults;
     
-    /// @notice Mapping from gameId => roundId => deposited amount to strategy
+    /// @notice Mapping from gameId => roundId => deposited amount to vault
     mapping(bytes32 => mapping(uint256 => uint256)) public deployedAmounts;
+    
+    /// @notice Mapping from gameId => roundId => vault shares received
+    mapping(bytes32 => mapping(uint256 => uint256)) public deployedShares;
 
     // ============ Events ============
     
@@ -57,6 +60,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         address indexed owner,
         string gameName,
         uint16 devFeeBps,
+        uint16 depositFeeBps,
         address paymentToken
     );
     
@@ -72,13 +76,15 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         bytes32 indexed gameId,
         uint256 indexed roundId,
         address indexed user,
-        uint256 amount
+        uint256 amount,
+        uint256 depositFee
     );
     
     event FundsDeployed(
         bytes32 indexed gameId,
         uint256 indexed roundId,
-        uint256 amount
+        uint256 amount,
+        uint256 shares
     );
     
     event FundsWithdrawn(
@@ -112,7 +118,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         uint256 prize
     );
     
-    event StrategyUpdated(address indexed token, address indexed strategy);
+    event VaultUpdated(address indexed token, address indexed vault);
     event ProtocolTreasuryUpdated(address indexed newTreasury);
 
     // ============ Constructor ============
@@ -129,14 +135,18 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
     // ============ Admin Functions ============
     
     /**
-     * @notice Set the yield strategy for a specific token
-     * @param token ERC20 token address
-     * @param strategy Yield strategy contract address
+     * @notice Set the ERC4626 vault for a specific token
+     * @param token ERC20 token address (underlying asset)
+     * @param vault ERC4626 vault address
      */
-    function setStrategy(address token, address strategy) external onlyOwner {
+    function setVault(address token, address vault) external onlyOwner {
         if (token == address(0)) revert Errors.ZeroAddress();
-        strategies[token] = strategy;
-        emit StrategyUpdated(token, strategy);
+        if (vault != address(0)) {
+            // Verify vault's underlying asset matches token
+            if (IERC4626(vault).asset() != token) revert Errors.InvalidPaymentToken();
+        }
+        vaults[token] = vault;
+        emit VaultUpdated(token, vault);
     }
     
     /**
@@ -169,6 +179,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
      * @notice Create a new game
      * @param gameName Unique name for the game
      * @param devFeeBps Developer fee in basis points (max 10000)
+     * @param depositFeeBps Deposit fee in basis points - goes to prize pool (max 1000 = 10%)
      * @param treasury Address to receive developer fees
      * @param paymentToken ERC20 token accepted for deposits
      * @return gameId The unique identifier for the created game
@@ -176,10 +187,12 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
     function createGame(
         string calldata gameName,
         uint16 devFeeBps,
+        uint16 depositFeeBps,
         address treasury,
         address paymentToken
     ) external whenNotPaused returns (bytes32 gameId) {
         if (devFeeBps > BPS_DENOMINATOR) revert Errors.InvalidDevFeeBps();
+        if (depositFeeBps > 1000) revert Errors.InvalidDevFeeBps(); // Max 10% deposit fee
         if (paymentToken == address(0)) revert Errors.InvalidPaymentToken();
         if (treasury == address(0)) revert Errors.ZeroAddress();
         
@@ -191,13 +204,14 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
             owner: msg.sender,
             gameName: gameName,
             devFeeBps: devFeeBps,
+            depositFeeBps: depositFeeBps,
             treasury: treasury,
             roundCounter: 0,
             paymentToken: paymentToken,
             initialized: true
         });
         
-        emit GameCreated(gameId, msg.sender, gameName, devFeeBps, paymentToken);
+        emit GameCreated(gameId, msg.sender, gameName, devFeeBps, depositFeeBps, paymentToken);
     }
 
     // ============ Round Management ============
@@ -228,6 +242,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
             gameId: gameId,
             roundId: roundId,
             totalDeposit: 0,
+            bonusPrizePool: 0,
             devFee: 0,
             totalWin: 0,
             startTs: startTs,
@@ -294,15 +309,20 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         // Transfer tokens from user
         IERC20(game.paymentToken).safeTransferFrom(msg.sender, address(this), amount);
         
-        // Update round state
-        round.totalDeposit += amount;
+        // Calculate deposit fee (goes to bonus prize pool)
+        uint256 depositFee = (amount * game.depositFeeBps) / BPS_DENOMINATOR;
+        uint256 netDeposit = amount - depositFee;
         
-        // Update user state
+        // Update round state
+        round.totalDeposit += netDeposit;
+        round.bonusPrizePool += depositFee;
+        
+        // Update user state (user gets credit for net deposit)
         UserDeposit storage userDep = userDeposits[gameId][roundId][msg.sender];
-        userDep.depositAmount += amount;
+        userDep.depositAmount += netDeposit;
         userDep.exists = true;
         
-        emit Deposited(gameId, roundId, msg.sender, amount);
+        emit Deposited(gameId, roundId, msg.sender, netDeposit, depositFee);
     }
     
     /**
@@ -340,11 +360,11 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
     // ============ Game Owner Actions ============
     
     /**
-     * @notice Deploy round funds to yield strategy
+     * @notice Deploy round funds to ERC4626 vault
      * @param gameId The game identifier
      * @param roundId The round identifier
      */
-    function depositToStrategy(
+    function depositToVault(
         bytes32 gameId,
         uint256 roundId
     ) external nonReentrant whenNotPaused {
@@ -356,7 +376,6 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         updateRoundStatus(gameId, roundId);
         
         // Can deploy during Locking or InProgress (if owner wants early deployment)
-        // But typically after InProgress ends
         if (round.status == RoundStatus.NotStarted || 
             round.status == RoundStatus.ChoosingWinners ||
             round.status == RoundStatus.DistributingRewards) {
@@ -366,27 +385,29 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         if (round.fundsDeployed) revert Errors.FundsAlreadyDeployed();
         if (round.totalDeposit == 0) revert Errors.InvalidAmount();
         
-        address strategy = strategies[game.paymentToken];
-        if (strategy == address(0)) revert Errors.StrategyNotSet();
+        address vault = vaults[game.paymentToken];
+        if (vault == address(0)) revert Errors.StrategyNotSet();
         
-        uint256 amount = round.totalDeposit;
+        // Deploy both deposits and bonus prize pool to vault
+        uint256 amount = round.totalDeposit + round.bonusPrizePool;
         
-        // Approve and deposit to strategy
-        IERC20(game.paymentToken).safeIncreaseAllowance(strategy, amount);
-        IYieldStrategy(strategy).deposit(amount);
+        // Approve vault and deposit
+        IERC20(game.paymentToken).safeIncreaseAllowance(vault, amount);
+        uint256 shares = IERC4626(vault).deposit(amount, address(this));
         
         round.fundsDeployed = true;
         deployedAmounts[gameId][roundId] = amount;
+        deployedShares[gameId][roundId] = shares;
         
-        emit FundsDeployed(gameId, roundId, amount);
+        emit FundsDeployed(gameId, roundId, amount, shares);
     }
     
     /**
-     * @notice Withdraw funds from yield strategy
+     * @notice Withdraw funds from ERC4626 vault
      * @param gameId The game identifier
      * @param roundId The round identifier
      */
-    function withdrawFromStrategy(
+    function withdrawFromVault(
         bytes32 gameId,
         uint256 roundId
     ) external nonReentrant whenNotPaused {
@@ -402,18 +423,19 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         }
         if (!round.fundsDeployed) revert Errors.FundsNotDeployed();
         
-        address strategy = strategies[game.paymentToken];
-        if (strategy == address(0)) revert Errors.StrategyNotSet();
+        address vault = vaults[game.paymentToken];
+        if (vault == address(0)) revert Errors.StrategyNotSet();
         
-        uint256 balanceBefore = IERC20(game.paymentToken).balanceOf(address(this));
-        IYieldStrategy(strategy).withdrawAll();
-        uint256 balanceAfter = IERC20(game.paymentToken).balanceOf(address(this));
-        
-        uint256 withdrawn = balanceAfter - balanceBefore;
+        uint256 shares = deployedShares[gameId][roundId];
         uint256 principal = deployedAmounts[gameId][roundId];
+        
+        // Redeem all shares for underlying assets
+        uint256 withdrawn = IERC4626(vault).redeem(shares, address(this), address(this));
+        
         uint256 yieldAmount = withdrawn > principal ? withdrawn - principal : 0;
         
         round.fundsDeployed = false;
+        deployedShares[gameId][roundId] = 0;
         
         emit FundsWithdrawn(gameId, roundId, principal, yieldAmount);
     }
@@ -442,35 +464,24 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         
         uint256 vaultBalance = IERC20(game.paymentToken).balanceOf(address(this));
         
-        // Calculate yield: current balance - total deposits across all active rounds
-        // For simplicity, we track per-round
-        uint256 principal = round.totalDeposit;
+        // Principal = totalDeposit + bonusPrizePool (both are held in contract)
+        uint256 principal = round.totalDeposit + round.bonusPrizePool;
         
-        // Assume all excess over principal is yield for this round
-        // In production, track accumulated balances more carefully
+        // Calculate yield: current balance - principal
         uint256 yieldAmount = vaultBalance >= principal ? vaultBalance - principal : 0;
-        
-        // Recalculate based on deployed amount tracking
-        uint256 deployedPrincipal = deployedAmounts[gameId][roundId];
-        if (deployedPrincipal > 0) {
-            // We withdrew everything, so let's calculate yield properly
-            // vaultBalance should be at least round.totalDeposit if no losses
-            // Actually we need to track what we withdrew specifically for this round
-            // For now, use the difference
-        }
         
         uint256 performanceFee = 0;
         uint256 devFee = 0;
-        uint256 prizePool = 0;
+        uint256 yieldPrize = 0;
         
         if (yieldAmount > 0) {
-            // Calculate performance fee (20%)
+            // Calculate performance fee (20%) on yield only
             performanceFee = (yieldAmount * PERFORMANCE_FEE_BPS) / BPS_DENOMINATOR;
             uint256 afterPerformance = yieldAmount - performanceFee;
             
-            // Calculate dev fee on remaining
+            // Calculate dev fee on remaining yield
             devFee = (afterPerformance * game.devFeeBps) / BPS_DENOMINATOR;
-            prizePool = afterPerformance - devFee;
+            yieldPrize = afterPerformance - devFee;
             
             // Transfer fees
             if (performanceFee > 0) {
@@ -481,11 +492,14 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
             }
         }
         
+        // Total prize = yield prize + bonus prize pool (from deposit fees)
+        uint256 totalPrize = yieldPrize + round.bonusPrizePool;
+        
         round.isSettled = true;
-        round.totalWin = prizePool;
+        round.totalWin = totalPrize;
         round.devFee = devFee;
         
-        emit RoundSettled(gameId, roundId, yieldAmount, performanceFee, devFee, prizePool);
+        emit RoundSettled(gameId, roundId, yieldAmount, performanceFee, devFee, totalPrize);
     }
     
     /**
