@@ -250,7 +250,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
             lockTime: lockTime,
             isSettled: false,
             status: RoundStatus.NotStarted,
-            fundsDeployed: false
+            isWithdrawn: false
         });
         
         game.roundCounter++;
@@ -382,22 +382,24 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
             revert Errors.RoundNotActive();
         }
         
-        if (round.fundsDeployed) revert Errors.FundsAlreadyDeployed();
         if (round.totalDeposit == 0) revert Errors.InvalidAmount();
         
         address vault = vaults[game.paymentToken];
         if (vault == address(0)) revert Errors.StrategyNotSet();
         
-        // Deploy both deposits and bonus prize pool to vault
-        uint256 amount = round.totalDeposit + round.bonusPrizePool;
+        // Only deploy the portion that hasn't been deployed yet
+        uint256 totalFunds = round.totalDeposit + round.bonusPrizePool;
+        uint256 alreadyDeployed = deployedAmounts[gameId][roundId];
+        uint256 amount = totalFunds - alreadyDeployed;
+        
+        if (amount == 0) revert Errors.InvalidAmount();
         
         // Approve vault and deposit
         IERC20(game.paymentToken).safeIncreaseAllowance(vault, amount);
         uint256 shares = IERC4626(vault).deposit(amount, address(this));
         
-        round.fundsDeployed = true;
-        deployedAmounts[gameId][roundId] = amount;
-        deployedShares[gameId][roundId] = shares;
+        deployedAmounts[gameId][roundId] += amount;
+        deployedShares[gameId][roundId] += shares;
         
         emit FundsDeployed(gameId, roundId, amount, shares);
     }
@@ -421,12 +423,14 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         if (round.status != RoundStatus.ChoosingWinners) {
             revert Errors.RoundNotEnded();
         }
-        if (!round.fundsDeployed) revert Errors.FundsNotDeployed();
+        if (round.isWithdrawn) revert Errors.FundsAlreadyWithdrawn();
+        
+        uint256 shares = deployedShares[gameId][roundId];
+        if (shares == 0) revert Errors.FundsNotDeployed();
         
         address vault = vaults[game.paymentToken];
         if (vault == address(0)) revert Errors.StrategyNotSet();
         
-        uint256 shares = deployedShares[gameId][roundId];
         uint256 principal = deployedAmounts[gameId][roundId];
         
         // Redeem all shares for underlying assets
@@ -434,7 +438,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         
         uint256 yieldAmount = withdrawn > principal ? withdrawn - principal : 0;
         
-        round.fundsDeployed = false;
+        round.isWithdrawn = true;
         deployedShares[gameId][roundId] = 0;
         
         emit FundsWithdrawn(gameId, roundId, principal, yieldAmount);
@@ -460,7 +464,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
             revert Errors.RoundNotEnded();
         }
         if (round.isSettled) revert Errors.RoundAlreadySettled();
-        if (round.fundsDeployed) revert Errors.FundsNotDeployed(); // Must withdraw first
+        if (!round.isWithdrawn) revert Errors.FundsNotWithdrawn(); // Must withdraw first
         
         uint256 vaultBalance = IERC20(game.paymentToken).balanceOf(address(this));
         

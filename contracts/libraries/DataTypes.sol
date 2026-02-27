@@ -44,7 +44,7 @@ struct Round {
     uint64 lockTime;         // Additional lock period after end
     bool isSettled;          // Settlement completed flag
     RoundStatus status;      // Current round status
-    bool fundsDeployed;      // Whether funds are in yield strategy
+    bool isWithdrawn;        // Whether funds have been withdrawn from vault
 }
 
 /**

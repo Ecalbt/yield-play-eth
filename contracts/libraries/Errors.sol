@@ -60,11 +60,14 @@ library Errors {
     /// @notice Thrown when round does not exist
     error RoundNotFound();
     
-    /// @notice Thrown when funds are already deployed
-    error FundsAlreadyDeployed();
+    /// @notice Thrown when funds have already been withdrawn from vault
+    error FundsAlreadyWithdrawn();
     
-    /// @notice Thrown when funds are not deployed
+    /// @notice Thrown when funds have not been deployed to vault yet
     error FundsNotDeployed();
+    
+    /// @notice Thrown when funds must be withdrawn from vault before settling
+    error FundsNotWithdrawn();
     
     /// @notice Thrown when strategy is not set
     error StrategyNotSet();
