@@ -245,9 +245,11 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
             bonusPrizePool: 0,
             devFee: 0,
             totalWin: 0,
+            yieldAmount: 0,
             startTs: startTs,
             endTs: endTs,
             lockTime: lockTime,
+            initialized: true,
             isSettled: false,
             status: RoundStatus.NotStarted,
             isWithdrawn: false
@@ -438,6 +440,7 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         
         uint256 yieldAmount = withdrawn > principal ? withdrawn - principal : 0;
         
+        round.yieldAmount = yieldAmount;
         round.isWithdrawn = true;
         deployedShares[gameId][roundId] = 0;
         
@@ -457,7 +460,8 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         Round storage round = rounds[gameId][roundId];
         
         if (msg.sender != game.owner) revert Errors.Unauthorized();
-        
+        if (round.initialized == false) revert Errors.RoundNotFound();
+
         updateRoundStatus(gameId, roundId);
         
         if (round.status != RoundStatus.ChoosingWinners) {
@@ -465,14 +469,8 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
         }
         if (round.isSettled) revert Errors.RoundAlreadySettled();
         if (!round.isWithdrawn) revert Errors.FundsNotWithdrawn(); // Must withdraw first
-        
-        uint256 vaultBalance = IERC20(game.paymentToken).balanceOf(address(this));
-        
-        // Principal = totalDeposit + bonusPrizePool (both are held in contract)
-        uint256 principal = round.totalDeposit + round.bonusPrizePool;
-        
-        // Calculate yield: current balance - principal
-        uint256 yieldAmount = vaultBalance >= principal ? vaultBalance - principal : 0;
+
+        uint256 yieldAmount = round.yieldAmount;
         
         uint256 performanceFee = 0;
         uint256 devFee = 0;
@@ -561,6 +559,10 @@ contract YieldPlay is ReentrancyGuard, Ownable, Pausable {
             revert Errors.RoundNotCompleted();
         }
         if (!round.isSettled) revert Errors.RoundNotSettled();
+
+        if (round.totalWin > 0) {
+            IERC20(game.paymentToken).safeTransfer(game.treasury, round.totalWin);
+        }
         
         // Allow finalization even if not all prizes distributed
         // Remaining goes back to depositors proportionally or stays for next round

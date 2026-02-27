@@ -39,9 +39,11 @@ struct Round {
     uint256 bonusPrizePool;  // Accumulated deposit fees for prize pool
     uint256 devFee;          // Accumulated dev fees
     uint256 totalWin;        // Remaining prize pool to distribute
+    uint256 yieldAmount;     // Total yield generated from vault
     uint64 startTs;          // Round start timestamp
     uint64 endTs;            // Round end timestamp (deposits close)
     uint64 lockTime;         // Additional lock period after end
+    bool initialized;        // Whether the round has been initialized
     bool isSettled;          // Settlement completed flag
     RoundStatus status;      // Current round status
     bool isWithdrawn;        // Whether funds have been withdrawn from vault
