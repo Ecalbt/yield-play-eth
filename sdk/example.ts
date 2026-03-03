@@ -16,13 +16,13 @@ config();
 
 // ============ Configuration ============
 
-// Sepolia Testnet Deployment
-const YIELD_PLAY_ADDRESS = "0x02AA158dc37f4E1128CeE3E69e9E59920E799F90";
-const RPC_URL = "https://ethereum-sepolia-rpc.publicnode.com";
+// Avalanche Fuji C-Chain Testnet Deployment
+const YIELD_PLAY_ADDRESS = "0xECeE24DC8273647917578f16Ad2e6f26212b8Dc5";
+const RPC_URL = "https://api.avax-test.network/ext/bc/C/rpc";
 const PRIVATE_KEY = process.env.PRIVATE_KEY || ""; // Set in .env file
 
-// Token addresses on Sepolia
-const TOKEN_ADDRESS = "0xdd13E55209Fd76AfE204dBda4007C227904f0a81"; // Vault's underlying token
+// Token addresses on Avalanche Fuji (MockUSDC - 6 decimals)
+const TOKEN_ADDRESS = "0x1C5dB89a642e39F6dC79BEDfa76029af17FE3A04"; // MockUSDC on Fuji
 
 // ============ Initialize SDK ============
 
@@ -65,6 +65,15 @@ async function exampleCreateGameAndRound() {
   const signerAddress = await signer.getAddress();
   console.log("Signer address:", signerAddress);
 
+  // Check configured vault for the token
+  console.log("\n--- Vault Configuration ---");
+  const vaultAddress = await sdk.getVault(TOKEN_ADDRESS);
+  console.log("Token address:", TOKEN_ADDRESS);
+  console.log("Vault address:", vaultAddress);
+  if (vaultAddress === "0x0000000000000000000000000000000000000000") {
+    throw new Error("No vault configured for this token! Please set vault first.");
+  }
+
   // 1. Create a new game
   console.log("\n--- Creating Game ---");
   const gameResult = await sdk.createGame({
@@ -91,6 +100,10 @@ async function exampleCreateGameAndRound() {
 
   console.log("Round created!");
   console.log("Round ID:", roundResult.roundId.toString());
+
+  // Verify vault from round info
+  const round = await sdk.getRound(gameResult.gameId, roundResult.roundId);
+  console.log("Round's vault:", round.vault);
 }
 
 // ============ Example: Full Round Lifecycle ============
